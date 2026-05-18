@@ -1,65 +1,97 @@
 import asyncio
+import aiohttp
 import os
-from flask import Flask
-from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ========== PASTE YOUR TOKEN HERE ==========
-TOKEN = "8689074287:AAHKshFAxpQ3zN3_0kFwJW6VQ7HJEKitAAw"
-# ===========================================
+TOKEN = os.environ.get("TELEGRAM_TOKEN")  # Set this in Railway
 
-# Flask app for Render
-flask_app = Flask(__name__)
+# ---------- REAL BLS ORAN SLOT CHECKER ----------
+async def check_bls_oran_slots():
+    """Return True if appointment slots are available in Oran."""
+    url = "https://algeria.blsspainvisa.com/oran/appointment"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=15) as resp:
+                html = await resp.text()
+                html_lower = html.lower()
+                # BLS usually shows "No slots available" or calendar disabled
+                if "no slots available" in html_lower:
+                    return False
+                if "no appointment" in html_lower:
+                    return False
+                if "calendar is disabled" in html_lower:
+                    return False
+                # If we see a date picker with enabled dates, assume slots exist
+                if 'class="ui-state-default"' in html and 'disabled' not in html:
+                    return True
+                # Fallback: look for any visible calendar day
+                if 'class="day"' in html and 'disabled' not in html:
+                    return True
+                return False
+    except Exception as e:
+        print(f"Checker error: {e}")
+        return False
 
-@flask_app.route('/')
-def home():
-    return "Bot is alive"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host='0.0.0.0', port=port)
-
-# Bot handlers
+# ---------- BOT COMMANDS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is working! Send /subscribe")
+    await update.message.reply_text(
+        "🇪🇸 *Spain Visa Slot Notifier (Oran)*\n\n"
+        "I will send you an instant alert when an appointment slot appears.\n\n"
+        "Commands:\n"
+        "/subscribe – get alerts\n"
+        "/unsubscribe – stop alerts\n"
+        "/status – check right now",
+        parse_mode="Markdown"
+    )
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    context.bot_data.setdefault("subs", set()).add(chat_id)
-    await update.message.reply_text("✅ Subscribed! You'll get alerts.")
+    context.bot_data.setdefault("subscribers", set()).add(chat_id)
+    await update.message.reply_text("✅ You are subscribed! You'll be notified when slots open.")
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    context.bot_data.get("subs", set()).discard(chat_id)
-    await update.message.reply_text("❌ Unsubscribed.")
+    context.bot_data.get("subscribers", set()).discard(chat_id)
+    await update.message.reply_text("❌ Unsubscribed. No further alerts.")
 
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Checking BLS Oran right now...")
+    available = await check_bls_oran_slots()
+    if available:
+        await update.message.reply_text("✅ *SLOTS AVAILABLE NOW!* Go to https://algeria.blsspainvisa.com/oran/appointment immediately.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ No slots at the moment. I'll notify you when any appear.")
+
+# ---------- BACKGROUND MONITOR ----------
 async def periodic_check(app):
-    import random
     while True:
-        subs = app.bot_data.get("subs", set())
-        if subs and random.random() < 0.05:  # 5% test chance
-            for chat_id in subs:
-                await app.bot.send_message(chat_id, "🔔 TEST ALERT: This is a test. Real BLS monitoring coming soon.")
-        await asyncio.sleep(60)
+        try:
+            available = await check_bls_oran_slots()
+            if available:
+                msg = (
+                    "🚨 *NEW VISA SLOT DETECTED IN ORAN!* 🚨\n"
+                    "Book now: https://algeria.blsspainvisa.com/oran/appointment\n"
+                    "Slots disappear quickly – act fast!"
+                )
+                for chat_id in app.bot_data.get("subscribers", set()):
+                    await app.bot.send_message(chat_id, msg, parse_mode="Markdown")
+        except Exception as e:
+            print(f"Periodic check error: {e}")
+        await asyncio.sleep(60)  # check every minute
 
-def main():
-    # Start Flask thread
-    Thread(target=run_flask, daemon=True).start()
-    
-    # Start bot
+# ---------- MAIN ----------
+async def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("unsubscribe", unsubscribe))
-    
-    # Start background checker
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(periodic_check(app))
-    
-    # Run bot
-    app.run_polling()
+    app.add_handler(CommandHandler("status", status))
+    asyncio.create_task(periodic_check(app))
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
